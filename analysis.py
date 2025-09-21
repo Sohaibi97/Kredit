@@ -325,4 +325,5 @@ def run_ensemble_analysis(df):
 
 # Execute the ensemble analysis
 print("🚀 Starting Banking Ensemble Analysis...")
+df = pd.read_csv("kredit_final.csv")  # Load your preprocessed dataset here  
 ensemble_results = run_ensemble_analysis(df)
