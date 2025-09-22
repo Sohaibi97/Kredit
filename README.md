@@ -8,7 +8,7 @@ imputate.py        # Imputation fehlender Werte
 remove_features.py # Feature-Reduktion
 predict.py         # Training, Prediction und Business-Summary
 main.py            # End-to-End Pipeline Runner
-präsi.ipynb        # Jupyter Notebook mit zusätzlichen Details
+präsi.ipynb        # Jupyter Notebook mit zusätzlichen Details zu was und warum und welche Reihenfolge gemacht wurde
 ```
 
 ---
@@ -27,16 +27,7 @@ pip install -U scikit-learn pandas numpy joblib
 
 ## 2) Datenformat
 
-Eingabe-CSV sollte numerische (oder bereits kodierte) Feature-Spalten und eine Zielspalte `target` (0/1) enthalten.  
-Beispiel:
-
-```csv
-age,income,score,target
-45,72000,0.63,1
-38,54000,0.45,0
-```
-
----
+Eingabe-CSV sollte numerische (oder bereits kodierte) Feature-Spalten und eine Zielspalte `target`, die Werte dieser Spalte werden erst später umgewandelt und die Werte 0 oder 1 gegeben
 
 ## 3) Wie ausführen?
 
@@ -71,14 +62,7 @@ So bekommst du zusätzliche Erklärungen und Ergebnisse.
 
 ---
 
-## 4) Troubleshooting
-
-- **Target column not found**: Mit `--target` in der CLI anpassen und Header prüfen.
-- **Alle Predictions sind -1**: Confidence-Threshold in `predict.py` anpassen oder Feature-Skalierung/Label-Balance prüfen.
-
----
-
-## 5) Projektstruktur
+## 4) Projektstruktur
 
 ```
 .
