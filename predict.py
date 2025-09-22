@@ -1,489 +1,470 @@
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import GradientBoostingClassifier
+from dataclasses import dataclass
+from typing import Tuple, Dict, Any, Optional
+
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import GridSearchCV, StratifiedKFold
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score, confusion_matrix
-import joblib
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
+from sklearn.metrics import (
+    accuracy_score, balanced_accuracy_score, roc_auc_score, confusion_matrix,
+    average_precision_score, roc_curve, precision_recall_curve, precision_score, recall_score
+)
 
-class OptimalBankingModel:
-    def __init__(self, confidence_threshold=0.85):
-        """
-        Optimal Banking Model: GradientBoosting with 85% confidence threshold
-        Based on analysis showing best balance of precision (90.7%) and coverage (36.1%)
-        """
-        self.confidence_threshold = confidence_threshold
-        self.model = None
-        self.scaler = StandardScaler()
-        self.is_trained = False
-        
-    def create_optimized_pipeline(self):
-        """Create the optimized GradientBoosting pipeline"""
-        
-        # Based on your cross-validation results, these are good hyperparameters
-        pipeline = Pipeline([
+import matplotlib.pyplot as plt
+
+
+# =========================
+# Utils
+# =========================
+
+def ks_statistic(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    if len(np.unique(y_true)) < 2:
+        return np.nan
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    return float(np.max(tpr - fpr))
+
+def gini_from_auc(auc: Optional[float]) -> float:
+    return (2*auc - 1) if (auc is not None and not np.isnan(auc)) else np.nan
+
+def choose_test_size(y: pd.Series, min_pos=30, min_neg=30, default=0.10, max_test=0.20) -> float:
+    N = len(y)
+    p = y.mean() if N > 0 else 0.5
+    for t in [default, 0.12, 0.15, 0.18, max_test]:
+        if (t*N*p >= min_pos) and (t*N*(1-p) >= min_neg):
+            return t
+    return max_test
+
+
+# =========================
+# Core class (LR @ 0.70)
+# =========================
+
+@dataclass
+class LRBanksConfig:
+    confidence_threshold: float = 0.70       # Gate: nur sehr sichere Fälle werden automatisiert
+    decision_threshold: float = 0.50         # Klassifikationsschwelle für "good" vs "bad"
+    cv_folds: int = 5
+    random_state: int = 42
+
+class LogisticBankingModel:
+    def __init__(self, config: LRBanksConfig = LRBanksConfig()):
+        self.config = config
+        self.model: Optional[Pipeline] = None
+        self.best_params: Optional[Dict[str, Any]] = None
+        self.is_trained: bool = False
+        self.feature_names_: Optional[list] = None
+
+    def _make_pipeline(self) -> Pipeline:
+        return Pipeline([
             ('scaler', StandardScaler()),
-            ('clf', GradientBoostingClassifier(
-                n_estimators=200,           # More trees for stability
-                learning_rate=0.1,          # Balanced learning rate
-                max_depth=5,               # Sufficient complexity
-                min_samples_split=2,       # Standard splitting
-                min_samples_leaf=1,        # Allow fine-grained splits
-                random_state=42,
-                verbose=0
-            ))
+            ('clf', LogisticRegression(max_iter=1000, random_state=self.config.random_state))
         ])
-        
-        return pipeline
-    
-    def train_with_hyperparameter_tuning(self, X, y):
-        """Train model with hyperparameter optimization"""
-        
-        print("Training Optimal Banking Model...")
-        print("Model: GradientBoostingClassifier")
-        print(f"Confidence Threshold: {self.confidence_threshold}")
-        print(f"Training Data: {len(X)} samples, {len(X.columns)} features")
-        
-        # Create base pipeline
-        base_pipeline = Pipeline([
-            ('scaler', StandardScaler()),
-            ('clf', GradientBoostingClassifier(random_state=42, verbose=0))
-        ])
-        
-        # Hyperparameter grid (focused on best performing ranges)
+
+    def fit_with_cv(self, X: pd.DataFrame, y: pd.Series) -> "LogisticBankingModel":
+        self.feature_names_ = list(X.columns)
+        pipe = self._make_pipeline()
         param_grid = {
-            'clf__n_estimators': [150, 200, 250],
-            'clf__learning_rate': [0.05, 0.1, 0.15],
-            'clf__max_depth': [4, 5, 6],
-            'clf__min_samples_split': [2, 5],
-            'clf__min_samples_leaf': [1, 2]
+            'clf__C': [0.01, 0.1, 1, 10, 100],
+            'clf__penalty': ['l1', 'l2'],
+            'clf__solver': ['liblinear']  # passend für l1/l2
         }
-        
-        # Grid search with cross-validation
-        grid_search = GridSearchCV(
-            base_pipeline,
-            param_grid,
-            cv=5,
-            scoring='roc_auc',
-            n_jobs=-1,
-            verbose=1
+        gs = GridSearchCV(
+            pipe, param_grid,
+            cv=StratifiedKFold(n_splits=self.config.cv_folds, shuffle=True, random_state=self.config.random_state),
+            scoring='roc_auc', n_jobs=-1, verbose=1
         )
-        
-        # Fit the model
-        grid_search.fit(X, y)
-        
-        # Store the best model
-        self.model = grid_search.best_estimator_
-        self.best_params = grid_search.best_params_
+        gs.fit(X, y)
+        self.model = gs.best_estimator_
+        self.best_params = gs.best_params_
         self.is_trained = True
-        
-        print(f"\nBest Parameters Found:")
-        for param, value in self.best_params.items():
-            print(f"  {param}: {value}")
-        
-        print(f"Best CV Score (ROC-AUC): {grid_search.best_score_:.4f}")
-        
+        print("\nBest Params:", self.best_params)
+        print(f"Best CV ROC-AUC: {gs.best_score_:.3f}")
         return self
-    
-    def predict_with_confidence(self, X):
-        """Make predictions with confidence filtering"""
-        
+
+    # ---- helper: predictions & gating ----
+    def _confidence_mask(self, proba: np.ndarray) -> np.ndarray:
+        thr = self.config.confidence_threshold
+        return (proba >= thr) | (proba <= (1 - thr))
+
+    # ---- prediction with abstention (confidence) ----
+    def predict_with_confidence(self, X: pd.DataFrame) -> Dict[str, Any]:
         if not self.is_trained:
-            raise ValueError("Model must be trained first. Call train_with_hyperparameter_tuning()")
-        
-        # Get probability predictions
-        probabilities = self.model.predict_proba(X)[:, 1]
-        
-        # Determine high-confidence predictions
-        high_confidence_mask = (
-            (probabilities >= self.confidence_threshold) | 
-            (probabilities <= (1 - self.confidence_threshold))
-        )
-        
-        # Create prediction array (default to -1 for uncertain cases)
-        predictions = np.full(len(X), -1)  # -1 means "requires human review"
-        
-        # Only predict for high-confidence cases
-        confident_indices = np.where(high_confidence_mask)[0]
-        confident_probabilities = probabilities[confident_indices]
-        confident_predictions = (confident_probabilities >= 0.5).astype(int)
-        
-        predictions[confident_indices] = confident_predictions
-        
+            raise ValueError("Model must be trained first.")
+        proba = self.model.predict_proba(X)[:, 1]
+        mask = self._confidence_mask(proba)
+        preds = np.full(len(X), -1)  # -1 = human review
+        # >>> Klassifikationsschwelle nutzt decision_threshold <<<
+        preds[mask] = (proba[mask] >= self.config.decision_threshold).astype(int)
         return {
-            'predictions': predictions,
-            'probabilities': probabilities,
-            'confident_mask': high_confidence_mask,
-            'coverage': np.sum(high_confidence_mask) / len(X)
+            'probabilities': proba,
+            'predictions': preds,
+            'confident_mask': mask,
+            'coverage': float(np.mean(mask))
         }
-    
-    def evaluate_model(self, X_test, y_test):
-        """Comprehensive model evaluation"""
-        
-        # Get predictions with confidence
-        results = self.predict_with_confidence(X_test)
-        
-        predictions = results['predictions']
-        probabilities = results['probabilities']
-        confident_mask = results['confident_mask']
-        coverage = results['coverage']
-        
-        # Extract confident predictions only
-        confident_indices = confident_mask
-        if np.sum(confident_indices) == 0:
-            return {
-                'coverage': 0.0,
-                'confident_accuracy': 0.0,
-                'confident_samples': 0,
-                'total_samples': len(X_test),
-                'error': 'No confident predictions made'
-            }
-        
-        y_confident = y_test[confident_indices]
-        pred_confident = predictions[confident_indices]
-        prob_confident = probabilities[confident_indices]
-        
-        # Calculate metrics for confident predictions only
-        confident_accuracy = accuracy_score(y_confident, pred_confident)
-        confident_balanced_accuracy = balanced_accuracy_score(y_confident, pred_confident)
-        
-        # ROC-AUC
-        if len(np.unique(y_confident)) > 1:
-            confident_auc = roc_auc_score(y_confident, prob_confident)
+
+    # ---- evaluation (confident subset + overall) ----
+    def evaluate(self, X: pd.DataFrame, y: pd.Series) -> Dict[str, Any]:
+        y_arr = y.values if hasattr(y, 'values') else y
+        res = self.predict_with_confidence(X)
+        proba, preds, mask = res['probabilities'], res['predictions'], res['confident_mask']
+        coverage = res['coverage']
+
+        # overall (ohne Abstain) – Klassifikation mit decision_threshold
+        overall_preds = (proba >= self.config.decision_threshold).astype(int)
+        if len(np.unique(y_arr)) > 1:
+            overall_auc = roc_auc_score(y_arr, proba)
+            overall_pr = average_precision_score(y_arr, proba)
         else:
-            confident_auc = np.nan
-        
-        # Confusion matrix and cost
-        cm = confusion_matrix(y_confident, pred_confident)
-        if cm.size == 4:
-            tn, fp, fn, tp = cm.ravel()
-            cost_5xFP_1xFN = 5 * fp + 1 * fn
+            overall_auc = overall_pr = np.nan
+        overall_ks = ks_statistic(y_arr, proba)
+        overall_precision = precision_score(y_arr, overall_preds, zero_division=0)
+        overall_recall = recall_score(y_arr, overall_preds, zero_division=0)
+
+        # confident subset
+        if mask.sum() == 0:
+            cm = np.array([[0, 0], [0, 0]])
+            conf_acc = conf_bacc = conf_auc = conf_pr = conf_ks = conf_prec = conf_rec = np.nan
+            fp = fn = cost = np.nan
+            conf_samples = 0
         else:
-            fp = fn = cost_5xFP_1xFN = np.nan
-        
+            y_conf = y_arr[mask]
+            p_conf = proba[mask]
+            yhat_conf = (p_conf >= self.config.decision_threshold).astype(int)
+
+            conf_acc = accuracy_score(y_conf, yhat_conf)
+            conf_bacc = balanced_accuracy_score(y_conf, yhat_conf)
+            conf_prec = precision_score(y_conf, yhat_conf, zero_division=0)
+            conf_rec = recall_score(y_conf, yhat_conf, zero_division=0)
+            if len(np.unique(y_conf)) > 1:
+                conf_auc = roc_auc_score(y_conf, p_conf)
+                conf_pr  = average_precision_score(y_conf, p_conf)
+                conf_ks  = ks_statistic(y_conf, p_conf)
+            else:
+                conf_auc = conf_pr = conf_ks = np.nan
+
+            cm = confusion_matrix(y_conf, yhat_conf, labels=[0, 1])
+            tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (np.nan, np.nan, np.nan, np.nan)
+            cost = 5*fp + 1*fn
+            conf_samples = int(mask.sum())
+
         return {
             'coverage': coverage,
-            'confident_accuracy': confident_accuracy,
-            'confident_balanced_accuracy': confident_balanced_accuracy,
-            'confident_auc': confident_auc,
-            'confident_samples': np.sum(confident_indices),
-            'total_samples': len(X_test),
-            'cost_5xFP_1xFN': cost_5xFP_1xFN,
+            'confident_samples': conf_samples,
+            'total_samples': len(y_arr),
+
+            'confident_accuracy': conf_acc,
+            'confident_balanced_accuracy': conf_bacc,
+            'confident_precision': conf_prec,
+            'confident_recall': conf_rec,
+            'confident_auc': conf_auc,
+            'confident_pr_auc': conf_pr,
+            'confident_ks': conf_ks,
+            'confident_gini': gini_from_auc(conf_auc),
+            'confusion_matrix': cm,
             'false_positives': fp,
             'false_negatives': fn,
-            'confusion_matrix': cm
+            'cost_5xFP_1xFN': cost,
+
+            'overall_auc': overall_auc,
+            'overall_pr_auc': overall_pr,
+            'overall_ks': overall_ks,
+            'overall_precision': overall_precision,
+            'overall_recall': overall_recall
         }
-    
-    def cross_validate_performance(self, X, y, cv_folds=5):
-        """Cross-validation to verify expected performance"""
-        
-        print(f"\nCross-Validation Performance Assessment")
-        print("-" * 50)
-        
-        skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-        cv_results = []
-        
-        for fold, (train_idx, test_idx) in enumerate(skf.split(X, y), 1):
-            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-            
-            # Train model for this fold
-            temp_model = OptimalBankingModel(self.confidence_threshold)
-            temp_model.train_with_hyperparameter_tuning(X_train, y_train)
-            
-            # Evaluate
-            fold_results = temp_model.evaluate_model(X_test, y_test.values)
-            fold_results['fold'] = fold
-            cv_results.append(fold_results)
-            
-            print(f"Fold {fold}: Accuracy={fold_results['confident_accuracy']:.3f}, "
-                  f"Coverage={fold_results['coverage']:.3f}, "
-                  f"Samples={fold_results['confident_samples']}/{fold_results['total_samples']}")
-        
-        # Summary statistics
-        cv_df = pd.DataFrame(cv_results)
-        
-        summary = {
-            'mean_accuracy': cv_df['confident_accuracy'].mean(),
-            'std_accuracy': cv_df['confident_accuracy'].std(),
-            'mean_coverage': cv_df['coverage'].mean(),
-            'std_coverage': cv_df['coverage'].std(),
-            'mean_cost': cv_df['cost_5xFP_1xFN'].mean(),
-            'mean_samples_per_fold': cv_df['confident_samples'].mean()
-        }
-        
-        print(f"\nCross-Validation Summary:")
-        print(f"  Confident Accuracy: {summary['mean_accuracy']:.3f} ± {summary['std_accuracy']:.3f}")
-        print(f"  Coverage: {summary['mean_coverage']:.3f} ± {summary['std_coverage']:.3f}")
-        print(f"  Average Cost: {summary['mean_cost']:.1f}")
-        print(f"  Average Samples per Fold: {summary['mean_samples_per_fold']:.0f}")
-        
-        return cv_results, summary
-    
-    def save_model(self, filepath):
-        """Save the trained model"""
+
+    # ---- Threshold-Kosten auf Training via OOF-CV optimieren (kein Test-Leak) ----
+    @staticmethod
+    def _conf_cost_at_t(y_true: np.ndarray, proba: np.ndarray, conf_thr: float, dec_thr: float):
+        mask = (proba >= conf_thr) | (proba <= (1 - conf_thr))
+        if mask.sum() == 0:
+            return dict(cost=np.inf, FP=np.nan, FN=np.nan, acc=np.nan, prec=np.nan, rec=np.nan,
+                        coverage=0.0, samples=0)
+        y_c = y_true[mask]
+        yhat = (proba[mask] >= dec_thr).astype(int)
+        cm = confusion_matrix(y_c, yhat, labels=[0,1])
+        tn, fp, fn, tp = cm.ravel()
+        cost = 5*fp + 1*fn
+        return dict(
+            cost=float(cost),
+            FP=int(fp), FN=int(fn),
+            acc=float(accuracy_score(y_c, yhat)),
+            prec=float(precision_score(y_c, yhat, zero_division=0)),
+            rec=float(recall_score(y_c, yhat, zero_division=0)),
+            coverage=float(np.mean(mask)),
+            samples=int(mask.sum())
+        )
+
+    def optimize_decision_threshold_on_training(
+        self, X: pd.DataFrame, y: pd.Series,
+        grid: np.ndarray = np.linspace(0.50, 0.80, 31)
+    ) -> Dict[str, Any]:
+        """
+        Verwendet Stratified K-Fold, sammelt OOF-Probas und minimiert die Kosten (5×FP + 1×FN)
+        nur in der confident-Zone. Setzt anschließend self.config.decision_threshold.
+        """
+        print("\nOptimizing decision threshold on TRAIN via OOF-CV (cost=5×FP + 1×FN)...")
+        skf = StratifiedKFold(n_splits=self.config.cv_folds, shuffle=True, random_state=self.config.random_state)
+        oof_idx = np.zeros(len(y), dtype=bool)
+        oof_proba = np.zeros(len(y), dtype=float)
+
+        for fold, (tri, tei) in enumerate(skf.split(X, y), 1):
+            Xtr, Xval = X.iloc[tri], X.iloc[tei]
+            ytr = y.iloc[tri]
+            tmp = LogisticBankingModel(self.config)
+            tmp.fit_with_cv(Xtr, ytr)  # inner tuning
+            oof_proba[tei] = tmp.model.predict_proba(Xval)[:, 1]
+            oof_idx[tei] = True
+            print(f"  Collected OOF probabilities for fold {fold}")
+
+        assert oof_idx.all(), "OOF probabilities missing for some samples."
+
+        # sweep thresholds
+        records = []
+        y_true = y.values
+        for t in grid:
+            m = self._conf_cost_at_t(y_true, oof_proba, self.config.confidence_threshold, t)
+            m['threshold'] = float(t)
+            records.append(m)
+        curve = pd.DataFrame(records)
+
+        # choose best threshold: min cost → tie-break by lower FP → higher acc → higher coverage
+        curve_sorted = curve.sort_values(['cost','FP','acc','coverage'], ascending=[True, True, False, False])
+        best_row = curve_sorted.iloc[0]
+        best_t = float(best_row['threshold'])
+        self.config.decision_threshold = best_t
+
+        print(f"Best decision threshold (OOF): {best_t:.3f} | cost={best_row['cost']:.1f} "
+              f"| FP={int(best_row['FP'])} | FN={int(best_row['FN'])} "
+              f"| acc={best_row['acc']:.3f} | cov={best_row['coverage']:.3f}")
+        return {'best_threshold': best_t, 'curve': curve, 'best_row': best_row.to_dict()}
+
+    # ---- CV on training only (for expectation) ----
+    def cross_validate_training(self, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
+        print("\nCross-Validation on TRAIN (expectations):")
+        skf = StratifiedKFold(n_splits=self.config.cv_folds, shuffle=True, random_state=self.config.random_state)
+        rows = []
+        for k, (tri, tei) in enumerate(skf.split(X, y), 1):
+            Xtr, Xte = X.iloc[tri], X.iloc[tei]
+            ytr, yte = y.iloc[tri], y.iloc[tei]
+            tmp = LogisticBankingModel(self.config)
+            tmp.fit_with_cv(Xtr, ytr)  # inner GS
+            m = tmp.evaluate(Xte, yte)
+            m['fold'] = k
+            rows.append(m)
+            print(f"  Fold {k}: Acc(conf)={m['confident_accuracy']:.3f} | Cov={m['coverage']:.3f}")
+        return pd.DataFrame(rows)
+
+    # ---- Explainability: top coefficients (standardized space) ----
+    def top_coefficients(self, k: int = 15) -> pd.DataFrame:
         if not self.is_trained:
-            raise ValueError("No trained model to save")
-        
-        joblib.dump({
-            'model': self.model,
-            'confidence_threshold': self.confidence_threshold,
-            'best_params': self.best_params
-        }, filepath)
-        
-        print(f"Model saved to {filepath}")
-    
-    def load_model(self, filepath):
-        """Load a saved model"""
-        saved_data = joblib.load(filepath)
-        
-        self.model = saved_data['model']
-        self.confidence_threshold = saved_data['confidence_threshold']
-        self.best_params = saved_data['best_params']
-        self.is_trained = True
-        
-        print(f"Model loaded from {filepath}")
-        print(f"Confidence Threshold: {self.confidence_threshold}")
-    
-    def get_business_summary(self, X, y):
-        """Generate business-friendly summary"""
-        
+            raise ValueError("Model must be trained.")
+        clf = self.model.named_steps['clf']
+        if not hasattr(clf, 'coef_'):
+            raise ValueError("No coefficients available.")
+        coefs = clf.coef_[0]
+        feats = self.feature_names_ or [f"f{i}" for i in range(len(coefs))]
+        df = pd.DataFrame({'feature': feats, 'coef': coefs, 'abs_coef': np.abs(coefs)})
+        return df.sort_values('abs_coef', ascending=False).head(k).reset_index(drop=True)
+
+    # ---- Plots (test set) ----
+    def plot_diagnostics(self, X: pd.DataFrame, y: pd.Series, topk: int = 15, figsize=(16, 12)):
         if not self.is_trained:
-            self.train_with_hyperparameter_tuning(X, y)
-        
-        # Get overall performance
-        eval_results = self.evaluate_model(X, y.values)
-        
-        total_applications = len(X)
-        automated_applications = int(total_applications * eval_results['coverage'])
-        manual_applications = total_applications - automated_applications
-        expected_accuracy = eval_results['confident_accuracy']
-        
-        print(f"\nBUSINESS IMPACT SUMMARY")
-        print("=" * 50)
-        print(f"Model Type: GradientBoosting with {self.confidence_threshold*100}% Confidence")
-        print(f"Training Data: {total_applications:,} applications")
-        print(f"\nAutomated Processing:")
-        print(f"  • {automated_applications:,} applications ({eval_results['coverage']:.1%})")
-        print(f"  • Expected accuracy: {expected_accuracy:.1%}")
-        print(f"  • Cost score: {eval_results['cost_5xFP_1xFN']:.1f}")
-        print(f"\nHuman Review Required:")
-        print(f"  • {manual_applications:,} applications ({1-eval_results['coverage']:.1%})")
-        print(f"\nRisk Assessment:")
-        print(f"  • False Positives: {eval_results['false_positives']}")
-        print(f"  • False Negatives: {eval_results['false_negatives']}")
-        print(f"  • Banking Suitable: {'Yes' if expected_accuracy >= 0.85 else 'No'}")
-    
-    def plot_model_diagnostics(self, X_test, y_test, figsize=(16, 12)):
-        """Create comprehensive diagnostic plots for the final model"""
-        
-        if not self.is_trained:
-            raise ValueError("Model must be trained first")
-        
-        import matplotlib.pyplot as plt
-        from sklearn.metrics import roc_curve, precision_recall_curve, auc
-        
-        # Get predictions
-        prediction_results = self.predict_with_confidence(X_test)
-        probabilities = prediction_results['probabilities']
-        confident_mask = prediction_results['confident_mask']
-        
-        # Create subplots
+            raise ValueError("Model must be trained.")
+        y_arr = y.values if hasattr(y, 'values') else y
+        pred = self.predict_with_confidence(X)
+        proba, mask = pred['probabilities'], pred['confident_mask']
+        conf_thr = self.config.confidence_threshold
+        dec_thr = self.config.decision_threshold
+
         fig, axes = plt.subplots(2, 3, figsize=figsize)
-        fig.suptitle(f'Banking Model Diagnostics - GradientBoosting (85% Confidence)', fontsize=16)
-        
-        # 1. ROC Curve
-        fpr, tpr, roc_thresholds = roc_curve(y_test, probabilities)
-        roc_auc = auc(fpr, tpr)
-        
-        axes[0,0].plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.3f})')
-        axes[0,0].plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random')
-        
-        # Mark confidence zones
-        conf_threshold_idx = np.where(roc_thresholds <= self.confidence_threshold)[0]
-        if len(conf_threshold_idx) > 0:
-            idx = conf_threshold_idx[0]
-            axes[0,0].scatter(fpr[idx], tpr[idx], color='red', s=100, zorder=5, 
-                            label=f'85% Confidence Point')
-        
-        axes[0,0].set_xlabel('False Positive Rate')
-        axes[0,0].set_ylabel('True Positive Rate')
-        axes[0,0].set_title('ROC Curve')
-        axes[0,0].legend()
-        axes[0,0].grid(True, alpha=0.3)
-        
-        # 2. Precision-Recall Curve
-        precision, recall, pr_thresholds = precision_recall_curve(y_test, probabilities)
-        pr_auc = auc(recall, precision)
-        
-        axes[0,1].plot(recall, precision, color='blue', lw=2, label=f'PR curve (AUC = {pr_auc:.3f})')
-        
-        # Baseline (random classifier performance)
-        baseline_precision = np.sum(y_test) / len(y_test)
-        axes[0,1].axhline(y=baseline_precision, color='red', linestyle='--', 
-                         label=f'Baseline ({baseline_precision:.3f})')
-        
-        # Mark confidence point
-        conf_pr_idx = np.where(pr_thresholds <= self.confidence_threshold)[0]
-        if len(conf_pr_idx) > 0:
-            idx = conf_pr_idx[0]
-            axes[0,1].scatter(recall[idx], precision[idx], color='red', s=100, zorder=5,
-                            label='85% Confidence Point')
-        
-        axes[0,1].set_xlabel('Recall')
-        axes[0,1].set_ylabel('Precision')
-        axes[0,1].set_title('Precision-Recall Curve')
-        axes[0,1].legend()
-        axes[0,1].grid(True, alpha=0.3)
-        
-        # 3. Probability Distribution
-        axes[0,2].hist(probabilities[y_test == 0], bins=30, alpha=0.7, 
-                      label='Bad Credit', color='red', density=True)
-        axes[0,2].hist(probabilities[y_test == 1], bins=30, alpha=0.7, 
-                      label='Good Credit', color='green', density=True)
-        
-        # Mark confidence thresholds
-        axes[0,2].axvline(self.confidence_threshold, color='black', linestyle='--', lw=2,
-                         label=f'Confidence Threshold ({self.confidence_threshold})')
-        axes[0,2].axvline(1 - self.confidence_threshold, color='black', linestyle='--', lw=2)
-        
-        axes[0,2].set_xlabel('Predicted Probability')
-        axes[0,2].set_ylabel('Density')
-        axes[0,2].set_title('Probability Distribution by Class')
-        axes[0,2].legend()
-        axes[0,2].grid(True, alpha=0.3)
-        
-        # 4. Threshold Analysis (Accuracy vs Coverage)
-        thresholds_range = np.arange(0.5, 0.99, 0.01)
-        threshold_results = []
-        
-        for thresh in thresholds_range:
-            temp_confident_mask = (probabilities >= thresh) | (probabilities <= (1 - thresh))
-            if np.sum(temp_confident_mask) > 0:
-                temp_coverage = np.sum(temp_confident_mask) / len(y_test)
-                y_conf = y_test[temp_confident_mask]
-                pred_conf = (probabilities[temp_confident_mask] >= 0.5).astype(int)
-                if len(y_conf) > 0:
-                    temp_accuracy = accuracy_score(y_conf, pred_conf)
-                    threshold_results.append({
-                        'threshold': thresh,
-                        'coverage': temp_coverage,
-                        'accuracy': temp_accuracy
-                    })
-        
-        threshold_df = pd.DataFrame(threshold_results)
-        
-        # Plot accuracy vs coverage
-        axes[1,0].plot(threshold_df['coverage'], threshold_df['accuracy'], 'b-', lw=2)
-        
-        # Mark current configuration
-        current_coverage = prediction_results['coverage']
-        current_results = self.evaluate_model(X_test, y_test)
-        current_accuracy = current_results['confident_accuracy']
-        
-        axes[1,0].scatter(current_coverage, current_accuracy, color='red', s=100, zorder=5,
-                         label=f'Current Config (85% conf)')
-        
-        axes[1,0].set_xlabel('Coverage')
-        axes[1,0].set_ylabel('Confident Accuracy')
-        axes[1,0].set_title('Accuracy vs Coverage Trade-off')
-        axes[1,0].legend()
-        axes[1,0].grid(True, alpha=0.3)
-        
-        # Add target zone
-        axes[1,0].axhline(y=0.85, color='green', linestyle=':', alpha=0.7, label='Banking Min Accuracy')
-        axes[1,0].axvline(x=0.30, color='orange', linestyle=':', alpha=0.7, label='Min Coverage')
-        
-        # 5. Confidence Zone Analysis
-        confident_probs = probabilities[confident_mask]
-        uncertain_probs = probabilities[~confident_mask]
-        
-        axes[1,1].hist(confident_probs, bins=20, alpha=0.7, label=f'Confident ({len(confident_probs)})', 
-                      color='blue', density=True)
-        axes[1,1].hist(uncertain_probs, bins=20, alpha=0.7, label=f'Uncertain ({len(uncertain_probs)})', 
-                      color='gray', density=True)
-        
-        axes[1,1].axvline(self.confidence_threshold, color='black', linestyle='--', lw=2)
-        axes[1,1].axvline(1 - self.confidence_threshold, color='black', linestyle='--', lw=2)
-        
-        axes[1,1].set_xlabel('Predicted Probability')
-        axes[1,1].set_ylabel('Density')
-        axes[1,1].set_title('Confident vs Uncertain Predictions')
-        axes[1,1].legend()
-        axes[1,1].grid(True, alpha=0.3)
-        
-        # 6. Confusion Matrix for Confident Predictions
-        if np.sum(confident_mask) > 0:
-            y_conf = y_test[confident_mask]
-            pred_conf = (probabilities[confident_mask] >= 0.5).astype(int)
-            cm = confusion_matrix(y_conf, pred_conf)
-            
-            im = axes[1,2].imshow(cm, interpolation='nearest', cmap='Blues')
-            axes[1,2].set_title('Confusion Matrix (Confident Predictions)')
-            
-            # Add text annotations
-            thresh = cm.max() / 2.
+        fig.suptitle(f'Logistic Regression (conf={conf_thr:.2f}; decision={dec_thr:.2f}) — Diagnostics', fontsize=15)
+
+        # ROC
+        fpr, tpr, roc_thresholds = roc_curve(y_arr, proba)
+        auc_roc = np.trapz(tpr, fpr)
+        axes[0,0].plot(fpr, tpr, lw=2, label=f'AUC={auc_roc:.3f}')
+        axes[0,0].plot([0,1], [0,1], lw=1, linestyle='--')
+        # mark decision threshold point on ROC (nearest)
+        idx = np.argmin(np.abs(roc_thresholds - dec_thr))
+        axes[0,0].scatter(fpr[idx], tpr[idx], s=80, label=f'Decision t={dec_thr:.2f}')
+        axes[0,0].set_title('ROC Curve'); axes[0,0].set_xlabel('FPR'); axes[0,0].set_ylabel('TPR')
+        axes[0,0].legend(); axes[0,0].grid(alpha=0.3)
+
+        # PR
+        precision, recall, pr_thresholds = precision_recall_curve(y_arr, proba)
+        # pr_thresholds length = n-1; sichere Indexwahl:
+        pr_idx = np.argmin(np.abs(pr_thresholds - dec_thr)) if len(pr_thresholds) > 0 else None
+        pr_auc = np.trapz(precision[::-1], recall[::-1])  # approx area
+        axes[0,1].plot(recall, precision, lw=2, label=f'PR-AUC≈{pr_auc:.3f}')
+        baseline = y_arr.mean()
+        axes[0,1].axhline(baseline, linestyle='--', lw=1, label=f'Baseline={baseline:.3f}')
+        if pr_idx is not None and pr_idx < len(recall):
+            axes[0,1].scatter(recall[pr_idx], precision[pr_idx], s=80, label=f'Decision t={dec_thr:.2f}')
+        axes[0,1].set_title('Precision-Recall'); axes[0,1].set_xlabel('Recall'); axes[0,1].set_ylabel('Precision')
+        axes[0,1].legend(); axes[0,1].grid(alpha=0.3)
+
+        # Probability distributions
+        axes[0,2].hist(proba[y_arr==0], bins=30, alpha=0.7, density=True, label='Bad (0)')
+        axes[0,2].hist(proba[y_arr==1], bins=30, alpha=0.7, density=True, label='Good (1)')
+        axes[0,2].axvline(conf_thr, linestyle='--', lw=2, label=f'Conf {conf_thr:.2f}')
+        axes[0,2].axvline(1-conf_thr, linestyle='--', lw=2)
+        axes[0,2].axvline(dec_thr, color='k', lw=2, label=f'Dec {dec_thr:.2f}')
+        axes[0,2].set_title('Probability Distribution'); axes[0,2].legend(); axes[0,2].grid(alpha=0.3)
+
+        # Accuracy vs Coverage (confidence sweep, decision fixed)
+        tgrid = np.arange(0.50, 0.96, 0.01)
+        covs, accs = [], []
+        for t in tgrid:
+            m = (proba >= t) | (proba <= (1-t))
+            if m.sum() > 0:
+                y_c = y_arr[m]
+                accs.append(accuracy_score(y_c, (proba[m] >= dec_thr)))
+                covs.append(np.mean(m))
+            else:
+                accs.append(np.nan); covs.append(0.0)
+        axes[1,0].plot(covs, accs, lw=2)
+        # mark current
+        cur_eval = self.evaluate(X, y)
+        axes[1,0].scatter([cur_eval['coverage']], [cur_eval['confident_accuracy']], s=80, label='Current config')
+        axes[1,0].axhline(0.85, linestyle=':', label='Banking min Acc 0.85')
+        axes[1,0].axvline(0.30, linestyle=':', label='Min Coverage 0.30')
+        axes[1,0].set_title('Accuracy vs Coverage (confidence sweep)'); axes[1,0].set_xlabel('Coverage'); axes[1,0].set_ylabel('Conf. Accuracy')
+        axes[1,0].legend(); axes[1,0].grid(alpha=0.3)
+
+        # Confident Confusion Matrix
+        axes[1,1].set_title('Confusion (confident subset)')
+        if mask.sum() > 0:
+            y_c = y_arr[mask]; yhat_c = (proba[mask] >= dec_thr).astype(int)
+            cm = confusion_matrix(y_c, yhat_c, labels=[0,1])
+            im = axes[1,1].imshow(cm, interpolation='nearest')
             for i in range(cm.shape[0]):
                 for j in range(cm.shape[1]):
-                    axes[1,2].text(j, i, format(cm[i, j], 'd'),
-                                  ha="center", va="center",
-                                  color="white" if cm[i, j] > thresh else "black")
-            
-            axes[1,2].set_ylabel('True Label')
-            axes[1,2].set_xlabel('Predicted Label')
-            axes[1,2].set_xticks([0, 1])
-            axes[1,2].set_yticks([0, 1])
-            axes[1,2].set_xticklabels(['Bad', 'Good'])
-            axes[1,2].set_yticklabels(['Bad', 'Good'])
+                    axes[1,1].text(j, i, int(cm[i,j]), ha='center', va='center',
+                                   color='white' if cm[i,j] > cm.max()/2 else 'black')
+            axes[1,1].set_xticks([0,1]); axes[1,1].set_yticks([0,1])
+            axes[1,1].set_xticklabels(['Bad(0)','Good(1)']); axes[1,1].set_yticklabels(['Bad(0)','Good(1)'])
         else:
-            axes[1,2].text(0.5, 0.5, 'No confident predictions', 
-                          ha='center', va='center', transform=axes[1,2].transAxes)
-            axes[1,2].set_title('Confusion Matrix (Confident Predictions)')
-        
+            axes[1,1].text(0.5, 0.5, 'No confident predictions', ha='center', va='center', transform=axes[1,1].transAxes)
+
+        # Top coefficients (explainability)
+        top = self.top_coefficients(k=topk)
+        axes[1,2].barh(top['feature'][::-1], top['coef'][::-1])
+        axes[1,2].set_title(f'Top {topk} coefficients (standardized)')
+        axes[1,2].set_xlabel('Coefficient')
         plt.tight_layout()
         plt.show()
-        
-        # Print diagnostic summary
-        print("\nMODEL DIAGNOSTIC SUMMARY")
-        print("-" * 40)
-        print(f"ROC AUC: {roc_auc:.3f}")
-        print(f"PR AUC: {pr_auc:.3f}")
-        print(f"Coverage: {prediction_results['coverage']:.1%}")
-        print(f"Confident Samples: {np.sum(confident_mask)}/{len(y_test)}")
-        print(f"Confident Accuracy: {current_accuracy:.1%}")
-        
-        return fig
 
-# Ready-to-use implementation
-def train_optimal_banking_model(df):
-    """Complete workflow to train the optimal banking model"""
-    
-    # Prepare data
+    # Optional: Plot Kostenkurve (decision threshold)
+    def plot_decision_threshold_cost_curve(self, y_true: np.ndarray, proba: np.ndarray,
+                                           grid: np.ndarray = np.linspace(0.50, 0.80, 31)):
+        recs = []
+        for t in grid:
+            m = self._conf_cost_at_t(y_true, proba, self.config.confidence_threshold, t)
+            m['threshold'] = float(t)
+            recs.append(m)
+        df = pd.DataFrame(recs)
+        plt.figure(figsize=(6,4))
+        plt.plot(df['threshold'], df['cost'], lw=2, label='Cost (5×FP + 1×FN)')
+        plt.axvline(self.config.decision_threshold, linestyle='--', label=f'Chosen t={self.config.decision_threshold:.2f}')
+        plt.xlabel('Decision Threshold'); plt.ylabel('Cost'); plt.title('Cost vs Decision Threshold')
+        plt.grid(alpha=0.3); plt.legend(); plt.show()
+        return df
+
+
+# =========================
+# Workflow (CV on train + holdout test)
+# =========================
+
+def prepare_banking_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+    if 'target' not in df.columns:
+        raise ValueError("DataFrame must contain 'target' column with values 1 (good) and 2 (bad).")
     y = (df['target'] == 1).astype(int)
     X = df.drop(columns=['target']).copy()
-    
-    print("OPTIMAL BANKING MODEL TRAINING")
-    print("=" * 50)
-    print("Configuration: GradientBoosting + 85% Confidence")
-    print("Expected: 90.7% Accuracy, 36.1% Coverage")
-    
-    # Create and train model
-    banking_model = OptimalBankingModel(confidence_threshold=0.85)
-    banking_model.train_with_hyperparameter_tuning(X, y)
-    
-    # Verify performance
-    cv_results, summary = banking_model.cross_validate_performance(X, y)
-    
-    # Business summary
-    banking_model.get_business_summary(X, y)
-    
-    return banking_model, cv_results, summary
+    print(f"Prepared data: n={len(X)}, d={X.shape[1]}, good%={y.mean():.2%}")
+    return X, y
 
-# Execute training
-print("Starting optimal banking model training...")
-df = pd.read_csv("kredit_final.csv")
-optimal_model, cv_results, performance_summary = train_optimal_banking_model(df)
+def train_lr_banking_with_holdout(
+    df: pd.DataFrame,
+    confidence_threshold: float = 0.70,
+    inner_cv_folds: int = 5,
+    test_size: Optional[float] = None,
+    run_train_cv_summary: bool = True,
+    optimize_decision_threshold: bool = True
+):
+    # Prepare + split
+    X, y = prepare_banking_data(df)
+    if test_size is None:
+        test_size = choose_test_size(y, min_pos=30, min_neg=30, default=0.10, max_test=0.20)
 
-print(f"\nModel ready! Use optimal_model.predict_with_confidence(new_data) for predictions.")
-print(f"To save: optimal_model.save_model('banking_model.pkl')")
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y, test_size=test_size, stratify=y, random_state=42
+    )
+    print(f"Split: train={len(X_tr)}, test={len(X_te)} (test_size={test_size:.0%})")
+
+    # Train with CV on TRAIN only
+    cfg = LRBanksConfig(confidence_threshold=confidence_threshold, cv_folds=inner_cv_folds)
+    model = LogisticBankingModel(cfg).fit_with_cv(X_tr, y_tr)
+
+    # Optional: decision threshold optimization on TRAIN via OOF
+    if optimize_decision_threshold:
+        opt = model.optimize_decision_threshold_on_training(X_tr, y_tr, grid=np.linspace(0.50, 0.80, 31))
+        # (Optional) OOF-Kostenkurve plotten:
+        # model.plot_decision_threshold_cost_curve(y_tr.values, ???)  # OOF proba steckt in opt['curve']
+
+    # Optional CV summary (outer CV across train) – zur Erwartung
+    cv_df = None
+    if run_train_cv_summary:
+        cv_df = model.cross_validate_training(X_tr, y_tr)
+        print("\nTraining CV (conf subset) summary:")
+        print(cv_df[['fold','confident_accuracy','coverage','cost_5xFP_1xFN']].round(3).to_string(index=False))
+
+    # One-shot evaluation on untouched TEST
+    print(f"\nUsing decision_threshold={model.config.decision_threshold:.2f}")
+    test_metrics = model.evaluate(X_te, y_te)
+    print("\n===== HOLDOUT TEST RESULTS =====")
+    for k, v in test_metrics.items():
+        if isinstance(v, float):
+            print(f"{k}: {v:.3f}" if not np.isnan(v) else f"{k}: NA")
+        else:
+            print(f"{k}: {v}")
+
+    # Plots on TEST
+    model.plot_diagnostics(X_te, y_te, topk=15)
+
+    # Decision Markdown (explainability)
+    top = model.top_coefficients(k=10)
+    md = f"""
+# Entscheidungsnotiz – Logistic Regression @ {int(confidence_threshold*100)}% Confidence, Decision @ {model.config.decision_threshold:.2f}
+
+**Warum LR @ 0.70 / Decision {model.config.decision_threshold:.2f}?**  
+- **Trennschärfe** (conf): ROC-AUC = {test_metrics['confident_auc']:.3f}, PR-AUC = {test_metrics['confident_pr_auc']:.3f}, KS = {test_metrics['confident_ks']:.3f}  
+- **Accuracy (conf)**: {test_metrics['confident_accuracy']:.3f} bei **Coverage** {test_metrics['coverage']:.3f}  
+- **Risiko**: FP={test_metrics['false_positives']}, FN={test_metrics['false_negatives']}, **Cost(5×FP+1×FN)**={test_metrics['cost_5xFP_1xFN']:.1f}  
+- **Interpretierbarkeit**: Signifikante Koeffizienten (standardisiert) → fachliche Nachvollziehbarkeit.
+
+**Top-Koeffizienten (absolut) – Richtung zeigt Einfluss auf „good“ (1):**  
+{top.to_string(index=False)}
+"""
+    print("\nMarkdown für Doku/Review:\n", md)
+    return model, (X_tr, X_te, y_tr, y_te), test_metrics, cv_df
+
+
+# =========================
+# Example main
+# =========================
+if __name__ == "__main__":
+    #  CSV einlesen (spalte 'target' = {1: good, 2: bad})
+    df = pd.read_csv("kredit_final.csv")
+    model, splits, test_metrics, cv_df = train_lr_banking_with_holdout(
+        df,
+        confidence_threshold=0.70,
+        inner_cv_folds=5,
+        test_size=None,
+        run_train_cv_summary=True,
+        optimize_decision_threshold=True
+    )
+
+    print("Dieses Skript definiert LR@0.70-Workflow mit OOF-optimiertem Decision-Threshold, CV (Train) + Holdout-Test + Plots + Erklär-Markdown.")
+    print("Nutzen: train_lr_banking_with_holdout(df, confidence_threshold=0.70)")
