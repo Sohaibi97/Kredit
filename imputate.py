@@ -4,6 +4,11 @@ import pandas as pd
 from sklearn.linear_model import LogisticRegression, RidgeCV
 from sklearn.model_selection import StratifiedKFold, KFold, cross_validate
 from sklearn.metrics import mean_absolute_error, precision_score, make_scorer
+import warnings
+
+# Filter out specific warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn.linear_model._logistic")
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.metrics._classification")
 
 # ======================================================================
 # Config
@@ -35,6 +40,10 @@ def assert_no_nan(df_like, name="X"):
         assert tot == 0, f"{name} enthält {tot} NaNs:\n{bad[bad>0].sort_values(ascending=False).head(15)}"
     else:
         assert not np.isnan(df_like).any(), f"{name} enthält NaNs."
+
+def precision_weighted_safe(y_true, y_pred):
+    """Custom precision scorer that handles zero division gracefully"""
+    return precision_score(y_true, y_pred, average='weighted', zero_division=0)
 
 # ======================================================================
 # Main
@@ -87,9 +96,8 @@ def main():
     assert_no_nan(X_purpose, "X_purpose")
     assert_no_nan(y_purpose.to_frame(), "y_purpose")
 
-    # Use lower max_iter; explicit multinomial
+    # Updated LogisticRegression without deprecated parameters
     logreg_multi = LogisticRegression(
-        multi_class="multinomial",
         solver="lbfgs",
         penalty="l2",
         C=BIG_C,
@@ -99,9 +107,9 @@ def main():
     )
     outer_cv_p = StratifiedKFold(n_splits=OUTER_FOLDS, shuffle=True, random_state=RANDOM_STATE)
 
-    # Standard precision_weighted scoring (ohne make_scorer wrapper)
+    # Custom scoring to handle precision warnings
     scoring_purpose = {
-        "precision_weighted": "precision_weighted",
+        "precision_weighted": make_scorer(precision_weighted_safe),
         "accuracy": "accuracy",
     }
     cvres_p = cross_validate(logreg_multi, X_purpose, y_purpose, cv=outer_cv_p,
@@ -159,7 +167,7 @@ def main():
         random_state=RANDOM_STATE
     )
     scoring_job = {
-        "precision_weighted": "precision_weighted",
+        "precision_weighted": make_scorer(precision_weighted_safe),
         "accuracy": "accuracy",
     }
     cvres_j = cross_validate(logreg_bin, X_job, y_job, cv=outer_cv_j,
